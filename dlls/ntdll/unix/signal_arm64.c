@@ -84,10 +84,20 @@ WINE_DEFAULT_DEBUG_CHANNEL(seh);
 static struct _aarch64_ctx *get_extended_sigcontext( const ucontext_t *sigcontext, unsigned int magic )
 {
     struct _aarch64_ctx *ctx = (struct _aarch64_ctx *)sigcontext->uc_mcontext.__reserved;
-    while ((char *)ctx < (char *)(&sigcontext->uc_mcontext + 1) && ctx->magic && ctx->size)
+    BOOL extra = FALSE;
+    while ((extra || (char *)ctx < (char *)(&sigcontext->uc_mcontext + 1)) && ctx->magic && ctx->size)
     {
         if (ctx->magic == magic) return ctx;
-        ctx = (struct _aarch64_ctx *)((char *)ctx + ctx->size);
+
+        if (ctx->magic == EXTRA_MAGIC)
+        {
+            ctx = (struct _aarch64_ctx *)((struct extra_context *)ctx)->datap;
+            extra = TRUE;
+        }
+        else
+        {
+            ctx = (struct _aarch64_ctx *)((char *)ctx + ctx->size);
+        }
     }
     return NULL;
 }
@@ -95,6 +105,11 @@ static struct _aarch64_ctx *get_extended_sigcontext( const ucontext_t *sigcontex
 static struct fpsimd_context *get_fpsimd_context( const ucontext_t *sigcontext )
 {
     return (struct fpsimd_context *)get_extended_sigcontext( sigcontext, FPSIMD_MAGIC );
+}
+
+static struct sve_context *get_sve_context( const ucontext_t *sigcontext )
+{
+    return (struct sve_context *)get_extended_sigcontext( sigcontext, SVE_MAGIC );
 }
 
 static DWORD64 get_fault_esr( ucontext_t *sigcontext )
@@ -229,6 +244,11 @@ void set_process_instrumentation_callback( void *callback )
     if (callback) FIXME( "Not supported.\n" );
 }
 
+static BOOLEAN is_arm64ec_emulator_stack( void *stack_ptr )
+{
+    return (ULONG64)stack_ptr <= NtCurrentTeb()->ChpeV2CpuAreaInfo->EmulatorStackBase &&
+           (ULONG64)stack_ptr > NtCurrentTeb()->ChpeV2CpuAreaInfo->EmulatorStackLimit;
+}
 
 /***********************************************************************
  *           unwind_builtin_dll
@@ -349,7 +369,19 @@ NTSTATUS signal_set_full_context( CONTEXT *context )
     struct syscall_frame *frame = arm64_thread_data()->syscall_frame;
     NTSTATUS status = NtSetContextThread( GetCurrentThread(), context );
 
-    if (!status && (context->ContextFlags & CONTEXT_INTEGER) == CONTEXT_INTEGER)
+    if (is_arm64ec()) {
+        ULONG suspend_count;
+        NtQueryInformationThread( GetCurrentThread(), ThreadSuspendCount, &suspend_count, sizeof(suspend_count), NULL );
+        if (suspend_count) {
+            CONTEXT suspend_context;
+            suspend_context.ContextFlags = CONTEXT_FULL | CONTEXT_EXCEPTION_REPORTING; /* TODO: check */
+            NtGetContextThread( GetCurrentThread(), &suspend_context );
+            wait_suspend( &suspend_context );
+            NtSetContextThread( GetCurrentThread(), &suspend_context );
+        }
+    }
+
+    if (!status && (context->ContextFlags & CONTEXT_INTEGER) == CONTEXT_INTEGER) /* TODO: also check with susp */
         frame->restore_flags |= CONTEXT_INTEGER;
 
     if (is_arm64ec() && !is_ec_code( frame->pc ))
@@ -444,7 +476,14 @@ NTSTATUS WINAPI NtGetContextThread( HANDLE handle, CONTEXT *context )
 
     if (!self)
     {
+        /* Avoid exposing JIT code pointers to other processes on ARM64EC */
         NTSTATUS ret = get_thread_context( handle, context, &self, IMAGE_FILE_MACHINE_ARM64 );
+        if (is_arm64ec() && !self) {
+            NtSuspendThread( handle, NULL );
+            ret = get_thread_context( handle, context, &self, IMAGE_FILE_MACHINE_ARM64 );
+            NtResumeThread( handle, NULL );
+            return ret;
+        }
         if (ret || !self) return ret;
     }
 
@@ -1306,9 +1345,14 @@ static void usr1_handler( int signal, siginfo_t *siginfo, void *sigcontext )
         NtGetContextThread( GetCurrentThread(), &context );
         wait_suspend( &context );
         NtSetContextThread( GetCurrentThread(), &context );
+        /* TODO: check */
     }
     else
     {
+        if (is_arm64ec() && NtCurrentTeb()->ChpeV2CpuAreaInfo->InSimulation) {
+            *NtCurrentTeb()->ChpeV2CpuAreaInfo->SuspendDoorbell = 1;
+            return;
+        }
         save_context( &context, sigcontext );
         context.ContextFlags |= CONTEXT_EXCEPTION_REPORTING;
         wait_suspend( &context );
@@ -1340,11 +1384,20 @@ static void usr2_handler( int signal, siginfo_t *siginfo, void *sigcontext )
 #ifdef linux
     {
         struct fpsimd_context *fp = get_fpsimd_context( sigcontext );
+        struct sve_context *sve = get_sve_context( sigcontext );
         if (fp)
         {
             fp->fpcr = frame->fpcr;
             fp->fpsr = frame->fpsr;
             memcpy( fp->vregs, frame->v, sizeof(fp->vregs) );
+        }
+
+        if (sve)
+        {
+            /* setup FEX SVE state */
+            ULONG64 vq = sve_vq_from_vl(sve->vl);
+            *(UINT16 *)((BYTE *)sve + SVE_SIG_PREG_OFFSET(vq, 2)) = 0x155;
+            *(UINT16 *)((BYTE *)sve + SVE_SIG_PREG_OFFSET(vq, 6)) = 0xffff;
         }
     }
 #elif defined(__APPLE__)

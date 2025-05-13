@@ -83,7 +83,7 @@ __ASM_GLOBAL_FUNC( "EXP+#KiUserExceptionDispatcher",
                    "test %rax,%rax\n\t"
                    "jz 1f\n\t"
                    "subq $0x28,%rsp\n\t"
-                   "leaq 0x30+0x3b0+0x4d0(%rsp),%rcx\n\t" /* rec */
+                   "leaq 0x30+0x3b0+0xcd0(%rsp),%rcx\n\t" /* rec */
                    "leaq 0x30(%rsp),%rdx\n\t"             /* context */
                    "call *%rax\n"
                    "addq $0x28,%rsp\n"
@@ -856,6 +856,13 @@ BOOLEAN WINAPI RtlIsProcessorFeaturePresent( UINT feature )
     return feature < PROCESSOR_FEATURE_MAX && user_shared_data->ProcessorFeatures[feature];
 }
 
+/***********************************************************************
+ *              RtlWow64SuspendThread (NTDLL.@)
+ */
+NTSTATUS WINAPI RtlWow64SuspendThread( HANDLE thread, ULONG *count )
+{
+    return NtSuspendThread( thread, count );
+}
 
 /*************************************************************************
  *		RtlWalkFrameChain (NTDLL.@)
